@@ -8,11 +8,13 @@ AVI files, clips, or model-ready archives.
 from __future__ import annotations
 
 import argparse
+import atexit
 import bisect
 import csv
 import json
 import logging
 import queue
+import signal
 import socket
 import threading
 import time
@@ -23,18 +25,31 @@ from typing import Any
 
 from packet_format import PacketSizeError, parse_packet
 
+# Optional fast JPEG encoder (libjpeg-turbo). If installed we'll use it to
+# reduce CPU usage; otherwise fallback to OpenCV encoding.
+try:
+    from turbojpeg import TurboJPEG  # type: ignore
 
-OUTPUT_WIDTH = 420
-OUTPUT_HEIGHT = 240
-OUTPUT_FPS = 60
-DEFAULT_JPEG_QUALITY = 85
+    _TURBOJPEG = TurboJPEG()
+except Exception:
+    _TURBOJPEG = None
+
+
+OUTPUT_WIDTH = 320
+OUTPUT_HEIGHT = 180
+OUTPUT_FPS = 10
+# Main load knob: how often frames are pulled from DXcam and queued for JPEG.
+# Suggested: 30 fps game -> 20-30; 60 fps -> 24-30 if stuttery, 45-60 if smooth;
+# 120 fps -> 30-60. Lower this first when the game starts hitching.
+DEFAULT_CAPTURE_POLL_HZ = 10.0
+DEFAULT_JPEG_QUALITY = 70
 DEFAULT_OUTPUT_DIR = "data/sessions"
 DEFAULT_UDP_HOST = "0.0.0.0"
-DEFAULT_UDP_PORT = 9999
+DEFAULT_UDP_PORT = 9998
 DEFAULT_MAX_PACKET_GAP_MS = 25.0
 DEFAULT_SOCKET_TIMEOUT_S = 0.2
-DEFAULT_FLUSH_EVERY = 120
-DEFAULT_VIDEO_QUEUE_SIZE = 180
+DEFAULT_FLUSH_EVERY = 600
+DEFAULT_VIDEO_QUEUE_SIZE = 30
 
 TELEMETRY_COLUMNS = (
     "TimestampMS",
@@ -108,6 +123,7 @@ class CaptureConfig:
     udp_host: str = DEFAULT_UDP_HOST
     udp_port: int = DEFAULT_UDP_PORT
     fps: int = OUTPUT_FPS
+    capture_poll_hz: float = DEFAULT_CAPTURE_POLL_HZ
     image_width: int = OUTPUT_WIDTH
     image_height: int = OUTPUT_HEIGHT
     jpeg_quality: int = DEFAULT_JPEG_QUALITY
@@ -173,12 +189,24 @@ def resize_frame_to_output(frame: Any, width: int = OUTPUT_WIDTH, height: int = 
 def write_jpeg_image(frame: Any, path: Path, quality: int = DEFAULT_JPEG_QUALITY) -> None:
     """Resize and write one BGR frame as a JPEG image."""
 
+    image = resize_frame_to_output(frame)
+
+    # Prefer libjpeg-turbo (turbojpeg Python binding) when available — it's
+    # significantly faster and more CPU-efficient than OpenCV's encoder.
+    if _TURBOJPEG is not None:
+        jpeg_bytes = _TURBOJPEG.encode(image, quality=int(quality))
+        with path.open("wb") as f:
+            f.write(jpeg_bytes)
+        return
+
+    # Fallback: use OpenCV to encode to memory then write atomically.
     import cv2
 
-    image = resize_frame_to_output(frame)
-    ok = cv2.imwrite(str(path), image, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    ok, buf = cv2.imencode('.jpg', image, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
     if not ok:
-        raise RuntimeError(f"could not write image: {path}")
+        raise RuntimeError(f"could not encode image to JPEG: {path}")
+    with path.open("wb") as f:
+        f.write(buf.tobytes())
 
 
 def read_csv_rows(path: Path) -> list[dict[str, str]]:
@@ -286,14 +314,26 @@ def video_worker(
     def grabber() -> None:
         nonlocal captured, queued, dropped
         camera = None
+        poll_interval_s = 1.0 / config.capture_poll_hz if config.capture_poll_hz > 0 else 0.0
+        next_poll = time.perf_counter()
         try:
             camera = dxcam.create(output_color="BGR")
             camera.start(target_fps=config.fps, video_mode=True)
-            logger.info("Video capture started at target_fps=%d", config.fps)
+            logger.info(
+                "Video capture started at target_fps=%d capture_poll_hz=%.1f",
+                config.fps,
+                config.capture_poll_hz,
+            )
             while not stop_event.is_set():
+                if poll_interval_s > 0:
+                    wait_s = next_poll - time.perf_counter()
+                    if wait_s > 0 and stop_event.wait(wait_s):
+                        break
+                    next_poll = max(next_poll + poll_interval_s, time.perf_counter())
+
                 frame = camera.get_latest_frame()
                 if frame is None:
-                    time.sleep(0.001)
+                    stop_event.wait(0.001)
                     continue
 
                 t_grab_ns = perf_ns()
@@ -429,6 +469,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--host", default=DEFAULT_UDP_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_UDP_PORT)
+    parser.add_argument("--capture-poll-hz", type=float, default=DEFAULT_CAPTURE_POLL_HZ)
     parser.add_argument("--jpeg-quality", type=int, default=DEFAULT_JPEG_QUALITY)
     parser.add_argument("--max-packet-gap-ms", type=float, default=DEFAULT_MAX_PACKET_GAP_MS)
     return parser.parse_args()
@@ -440,6 +481,7 @@ def main() -> None:
         output_dir=args.output_dir,
         udp_host=args.host,
         udp_port=args.port,
+        capture_poll_hz=args.capture_poll_hz,
         jpeg_quality=args.jpeg_quality,
         max_packet_gap_ms=args.max_packet_gap_ms,
     )
@@ -448,6 +490,8 @@ def main() -> None:
     stop_event = threading.Event()
     summary: dict[str, Any] = {}
     worker_errors: list[str] = []
+    finalize_lock = threading.Lock()
+    finalized = False
     manifest = {
         "session_dir": str(session_dir),
         "started_wall_time_iso": now_iso(),
@@ -457,6 +501,24 @@ def main() -> None:
     }
     write_manifest(session_dir, manifest)
 
+    stop_logged = False
+
+    def request_stop(_signum: int | None = None, _frame: Any = None) -> None:
+        nonlocal stop_logged
+        logger.info("Stop requested" if not stop_logged else "Stop already requested; finishing shutdown")
+        stop_logged = True
+        stop_event.set()
+
+    previous_signal_handlers: dict[int, Any] = {}
+    for stop_signal in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGBREAK", None)):
+        if stop_signal is None:
+            continue
+        try:
+            previous_signal_handlers[int(stop_signal)] = signal.getsignal(stop_signal)
+            signal.signal(stop_signal, request_stop)
+        except (OSError, ValueError):
+            pass
+
     def run_worker(name: str, target: Any) -> None:
         try:
             target(session_dir, config, stop_event, logger, summary)
@@ -465,38 +527,44 @@ def main() -> None:
             logger.exception("%s worker failed", name)
             stop_event.set()
 
+    def wait_for_workers() -> None:
+        while any(worker.is_alive() for worker in workers):
+            for worker in workers:
+                try:
+                    worker.join(timeout=0.2)
+                except KeyboardInterrupt:
+                    request_stop()
+
     workers = [
         threading.Thread(target=run_worker, args=("video", video_worker), name="video"),
         threading.Thread(target=run_worker, args=("udp", udp_worker), name="udp"),
     ]
 
-    try:
-        for worker in workers:
-            worker.start()
+    def finalize_session() -> None:
+        nonlocal finalized
+        with finalize_lock:
+            if finalized:
+                return
+            finalized = True
 
-        if args.duration is None:
-            while any(worker.is_alive() for worker in workers):
-                if worker_errors:
-                    break
-                time.sleep(0.2)
-        else:
-            deadline = time.monotonic() + args.duration
-            while time.monotonic() < deadline and not worker_errors:
-                time.sleep(0.2)
-    except KeyboardInterrupt:
-        logger.info("Stop requested")
-    finally:
         stop_event.set()
-        for worker in workers:
-            worker.join()
+        try:
+            wait_for_workers()
+        except BaseException as exc:  # noqa: BLE001 - finalizer must keep going to dataset.csv.
+            logger.exception("Shutdown wait interrupted")
+            worker_errors.append(f"shutdown: {exc}")
 
-        if not worker_errors:
+        try:
             summary["dataset"] = write_dataset_csv(session_dir, config.max_packet_gap_ms)
             logger.info(
                 "Dataset done: rows=%d valid_rows=%d",
                 summary["dataset"]["rows"],
                 summary["dataset"]["valid_rows"],
             )
+        except BaseException as exc:  # noqa: BLE001 - record why dataset.csv was not produced.
+            logger.exception("Failed to write dataset.csv")
+            summary["dataset_error"] = str(exc)
+            worker_errors.append(f"dataset: {exc}")
 
         manifest["ended_wall_time_iso"] = now_iso()
         manifest["perf_end_ns"] = perf_ns()
@@ -505,7 +573,30 @@ def main() -> None:
             manifest["errors"] = worker_errors
         write_manifest(session_dir, manifest)
         logger.info("Session written to %s", session_dir)
+        for handler in logger.handlers:
+            handler.flush()
         print(session_dir)
+
+    atexit.register(finalize_session)
+
+    try:
+        for worker in workers:
+            worker.start()
+
+        if args.duration is None:
+            while any(worker.is_alive() for worker in workers) and not worker_errors and not stop_event.is_set():
+                stop_event.wait(0.2)
+        else:
+            deadline = time.monotonic() + args.duration
+            while time.monotonic() < deadline and not worker_errors and not stop_event.is_set():
+                stop_event.wait(0.2)
+    except KeyboardInterrupt:
+        request_stop()
+    finally:
+        finalize_session()
+        atexit.unregister(finalize_session)
+        for stop_signal, previous_handler in previous_signal_handlers.items():
+            signal.signal(stop_signal, previous_handler)
         if worker_errors:
             raise SystemExit(1)
 
